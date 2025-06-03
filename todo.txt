@@ -1,0 +1,12 @@
+Use std::ios::binary (safer for perf)
+Use std::condition_variable::wait_until
+Avoid unnecessary date checks
+
+
+🔌 Offload flushing to a dedicated thread for overlapping compute/I/O
+
+Would you like to add metrics (e.g. flushed line count, write latency) or move to io_uring for kernel-level async I/O next?
+
+Add metrics (e.g., pool utilization, dropped writes)?
+
+
