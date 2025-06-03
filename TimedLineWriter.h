@@ -1,5 +1,4 @@
 #include <iostream>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -10,6 +9,10 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <boost/lockfree/queue.hpp>
 
 class TimedLineWriter {
@@ -24,7 +27,11 @@ public:
           queue(1024),
           stringPool(poolSize),
           stopFlag(false),
-          lineCount(0) {
+          lineCount(0),
+          mappedSize(0),
+          writeOffset(0),
+          fd(-1),
+          mappedData(nullptr) {
         for (size_t i = 0; i < poolSize; ++i) {
             stringPool.push(new std::string);
         }
@@ -35,7 +42,7 @@ public:
     ~TimedLineWriter() {
         stopFlag = true;
         if (workerThread.joinable()) workerThread.join();
-        if (file.is_open()) file.close();
+        closeFile();
         std::string* ptr;
         while (stringPool.pop(ptr)) delete ptr;
     }
@@ -75,7 +82,7 @@ public:
 
 private:
     void openNewFile() {
-        if (file.is_open()) file.close();
+        closeFile();
 
         auto t = std::time(nullptr);
         tm localTime;
@@ -88,10 +95,45 @@ private:
         strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &localTime);
 
         filename = filenamePrefix + "_" + buffer + ".log";
-        file.open(filename, std::ios::out | std::ios::app);
+        fd = ::open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd == -1) {
+            std::cerr << "Failed to open file." << std::endl;
+            return;
+        }
+
+        mappedSize = 10 * 1024 * 1024;  // 10MB
+        if (ftruncate(fd, mappedSize) == -1) {
+            std::cerr << "Failed to set file size." << std::endl;
+            ::close(fd);
+            fd = -1;
+            return;
+        }
+
+        mappedData = static_cast<char*>(mmap(nullptr, mappedSize, PROT_WRITE, MAP_SHARED, fd, 0));
+        if (mappedData == MAP_FAILED) {
+            std::cerr << "Failed to mmap file." << std::endl;
+            ::close(fd);
+            fd = -1;
+            mappedData = nullptr;
+            return;
+        }
+
         openTime = std::chrono::steady_clock::now();
         openDay = localTime.tm_mday;
         lineCount = 0;
+        writeOffset = 0;
+    }
+
+    void closeFile() {
+        if (mappedData && mappedData != MAP_FAILED) {
+            msync(mappedData, writeOffset, MS_SYNC);
+            munmap(mappedData, mappedSize);
+            mappedData = nullptr;
+        }
+        if (fd != -1) {
+            ::close(fd);
+            fd = -1;
+        }
     }
 
     void manageFileRotation() {
@@ -164,8 +206,12 @@ private:
 
             if (shouldFlush && batchSizeBytes > 0) {
                 manageFileRotation();
-                file << batchBuffer.str();
-                file.rdbuf()->pubsync();
+                std::string batchStr = batchBuffer.str();
+                if (writeOffset + batchStr.size() < mappedSize) {
+                    memcpy(mappedData + writeOffset, batchStr.data(), batchStr.size());
+                    writeOffset += batchStr.size();
+                    msync(mappedData, writeOffset, MS_SYNC);
+                }
                 batchBuffer.str("");
                 batchBuffer.clear();
                 batchSizeBytes = 0;
@@ -181,7 +227,6 @@ private:
     const std::string filenamePrefix;
     const size_t maxBatchBytes;
     const int maxBatchDelayMs;
-    std::ofstream file;
     std::string filename;
     std::atomic<bool> stopFlag;
     std::thread workerThread;
@@ -195,6 +240,11 @@ private:
     std::mutex fallbackMutex;
     std::condition_variable fallbackCV;
     std::deque<std::string> fallbackBuffer;
+
+    int fd;
+    char* mappedData;
+    size_t mappedSize;
+    size_t writeOffset;
 
     static constexpr int MAX_LINES = 100000;
     static constexpr int MAX_SECONDS = 60 * 5;
