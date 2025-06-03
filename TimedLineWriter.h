@@ -1,92 +1,118 @@
-#pragma once
-
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <chrono>
-#include <atomic>
 #include <ctime>
+#include <atomic>
 #include <vector>
-#include <memory>
+#include <deque>
+#include <mutex>
+#include <condition_variable>
 #include <boost/lockfree/queue.hpp>
 
 class TimedLineWriter {
 public:
-    TimedLineWriter(const std::string& baseFileName,
-                    size_t maxLines, int maxSeconds,
-                    size_t maxBatchBytes = 8192,
-                    int maxBatchDelayMs = 100)
-        : baseFileName(baseFileName),
-          maxLines(maxLines),
-          maxSeconds(maxSeconds),
+    TimedLineWriter(const std::string& filenamePrefix,
+                    size_t maxBatchBytes,
+                    size_t poolSize,
+                    int maxBatchDelayMs)
+        : filenamePrefix(filenamePrefix),
           maxBatchBytes(maxBatchBytes),
           maxBatchDelayMs(maxBatchDelayMs),
-          lineCount(0),
-          fileIndex(0),
+          queue(1024),
+          stringPool(poolSize),
           stopFlag(false),
-          queue(QUEUE_SIZE),
-          stringPool(POOL_SIZE)
-    {
-        // Pre-allocate string pool
-        for (size_t i = 0; i < POOL_SIZE; ++i) {
-            auto ptr = std::make_unique<std::string>();
-            stringPool.push(ptr.get());
-            poolStorage.push_back(std::move(ptr));
+          lineCount(0) {
+        for (size_t i = 0; i < poolSize; ++i) {
+            stringPool.push(new std::string);
         }
-
+        openNewFile();
         workerThread = std::thread(&TimedLineWriter::processQueue, this);
     }
 
-    void write(const std::string& text) {
-        std::string* strPtr = nullptr;
-        if (stringPool.pop(strPtr)) {
-            strPtr->assign(text);
-        } else {
-            strPtr = new std::string(text);  // fallback
-        }
-
-        while (!queue.push(strPtr)) {
-            std::this_thread::yield();
-        }
-    }
-
-    void stop() {
-        stopFlag = true;
-        if (workerThread.joinable())
-            workerThread.join();
-
-        cleanupRemaining();
-        closeFile();
-    }
-
     ~TimedLineWriter() {
-        stop();
+        stopFlag = true;
+        if (workerThread.joinable()) workerThread.join();
+        if (file.is_open()) file.close();
+        std::string* ptr;
+        while (stringPool.pop(ptr)) delete ptr;
+    }
+
+    bool write(const std::string& text, int timeoutMs = 50) {
+        using namespace std::chrono;
+        auto deadline = steady_clock::now() + milliseconds(timeoutMs);
+
+        std::string* strPtr = nullptr;
+        while (!stringPool.pop(strPtr)) {
+            if (steady_clock::now() >= deadline)
+                break;
+            std::this_thread::sleep_for(milliseconds(1));
+        }
+
+        if (strPtr) {
+            strPtr->assign(text);
+            while (!queue.push(strPtr)) {
+                if (steady_clock::now() >= deadline) {
+                    strPtr->clear();
+                    if (!stringPool.push(strPtr)) delete strPtr;
+                    break;
+                }
+                std::this_thread::sleep_for(milliseconds(1));
+            }
+            return true;
+        }
+
+        std::unique_lock<std::mutex> lock(fallbackMutex);
+        if (fallbackBuffer.size() < FALLBACK_MAX_SIZE) {
+            fallbackBuffer.emplace_back(text);
+            fallbackCV.notify_one();
+            return true;
+        }
+        return false;
     }
 
 private:
-    static constexpr size_t QUEUE_SIZE = 2048;
-    static constexpr size_t POOL_SIZE  = 2048;
+    void openNewFile() {
+        if (file.is_open()) file.close();
 
-    std::string baseFileName;
-    size_t maxLines;
-    int maxSeconds;
-    size_t maxBatchBytes;
-    int maxBatchDelayMs;
+        auto t = std::time(nullptr);
+        tm localTime;
+#ifdef _WIN32
+        localtime_s(&localTime, &t);
+#else
+        localtime_r(&t, &localTime);
+#endif
+        char buffer[64];
+        strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &localTime);
 
-    size_t lineCount;
-    int fileIndex;
-    std::ofstream file;
-    std::chrono::steady_clock::time_point fileStartTime;
-    std::tm openDate = {};
+        filename = filenamePrefix + "_" + buffer + ".log";
+        file.open(filename, std::ios::out | std::ios::app);
+        openTime = std::chrono::steady_clock::now();
+        openDay = localTime.tm_mday;
+        lineCount = 0;
+    }
 
-    boost::lockfree::queue<std::string*> queue;
-    boost::lockfree::queue<std::string*> stringPool;
-    std::vector<std::unique_ptr<std::string>> poolStorage;
+    void manageFileRotation() {
+        using namespace std::chrono;
+        auto now = steady_clock::now();
+        auto duration = duration_cast<seconds>(now - openTime).count();
 
-    std::atomic<bool> stopFlag;
-    std::thread workerThread;
+        auto t = std::time(nullptr);
+        tm localTime;
+#ifdef _WIN32
+        localtime_s(&localTime, &t);
+#else
+        localtime_r(&t, &localTime);
+#endif
+
+        if (lineCount >= MAX_LINES ||
+            duration >= MAX_SECONDS ||
+            localTime.tm_mday != openDay) {
+            openNewFile();
+        }
+    }
 
     void processQueue() {
         using namespace std::chrono;
@@ -97,24 +123,37 @@ private:
 
         while (true) {
             std::string* strPtr = nullptr;
-            bool gotLine = queue.pop(strPtr);
-            bool shouldFlush = false;
+            bool gotLine = false;
 
+            {
+                std::unique_lock<std::mutex> lock(fallbackMutex);
+                if (!fallbackBuffer.empty()) {
+                    std::string fallbackStr = std::move(fallbackBuffer.front());
+                    fallbackBuffer.pop_front();
+
+                    if (!stringPool.pop(strPtr)) {
+                        strPtr = new std::string(std::move(fallbackStr));
+                    } else {
+                        strPtr->assign(std::move(fallbackStr));
+                    }
+                    gotLine = true;
+                }
+            }
+
+            if (!gotLine) gotLine = queue.pop(strPtr);
+
+            bool shouldFlush = false;
             if (gotLine) {
                 size_t lineSize = strPtr->size() + 1;
                 if (batchSizeBytes + lineSize > maxBatchBytes && batchSizeBytes > 0) {
-                    // Delay until next flush
                     while (!queue.push(strPtr)) std::this_thread::yield();
                     shouldFlush = true;
                 } else {
                     batchBuffer << *strPtr << '\n';
                     batchSizeBytes += lineSize;
                     ++lineCount;
-
                     strPtr->clear();
-                    if (!stringPool.push(strPtr)) {
-                        delete strPtr;
-                    }
+                    if (!stringPool.push(strPtr)) delete strPtr;
                 }
             } else {
                 std::this_thread::sleep_for(milliseconds(5));
@@ -127,64 +166,37 @@ private:
                 manageFileRotation();
                 file << batchBuffer.str();
                 file.rdbuf()->pubsync();
-
                 batchBuffer.str("");
                 batchBuffer.clear();
                 batchSizeBytes = 0;
                 nextFlush = steady_clock::now() + milliseconds(maxBatchDelayMs);
             }
 
-            if (stopFlag && queue.empty() && batchSizeBytes == 0)
+            if (stopFlag && queue.empty() && batchSizeBytes == 0 && fallbackBuffer.empty())
                 break;
         }
     }
 
-    void manageFileRotation() {
-        using namespace std::chrono;
+private:
+    const std::string filenamePrefix;
+    const size_t maxBatchBytes;
+    const int maxBatchDelayMs;
+    std::ofstream file;
+    std::string filename;
+    std::atomic<bool> stopFlag;
+    std::thread workerThread;
+    std::chrono::steady_clock::time_point openTime;
+    int openDay;
+    size_t lineCount;
 
-        auto now = steady_clock::now();
-        auto elapsed = duration_cast<seconds>(now - fileStartTime).count();
-        std::time_t nowTime = std::time(nullptr);
-        std::tm* currentDate = std::localtime(&nowTime);
+    boost::lockfree::queue<std::string*> queue;
+    boost::lockfree::queue<std::string*> stringPool;
 
-        bool dayChanged = !file.is_open() ||
-                          currentDate->tm_yday != openDate.tm_yday ||
-                          currentDate->tm_year != openDate.tm_year;
+    std::mutex fallbackMutex;
+    std::condition_variable fallbackCV;
+    std::deque<std::string> fallbackBuffer;
 
-        if (!file.is_open() || lineCount >= maxLines || elapsed >= maxSeconds || dayChanged) {
-            closeFile();
-            openNewFile();
-        }
-    }
-
-    void openNewFile() {
-        fileStartTime = std::chrono::steady_clock::now();
-        std::time_t now = std::time(nullptr);
-        openDate = *std::localtime(&now);
-
-        std::string filename = baseFileName + "_" + std::to_string(fileIndex++) + ".txt";
-        file.open(filename, std::ios::out | std::ios::binary);
-        if (!file.is_open()) {
-            std::cerr << "❌ Failed to open file: " << filename << std::endl;
-        }
-
-        lineCount = 0;
-    }
-
-    void closeFile() {
-        if (file.is_open()) {
-            file.rdbuf()->pubsync();
-            file.close();
-        }
-    }
-
-    void cleanupRemaining() {
-        std::string* strPtr;
-        while (queue.pop(strPtr)) {
-            strPtr->clear();
-            if (!stringPool.push(strPtr)) {
-                delete strPtr;
-            }
-        }
-    }
+    static constexpr int MAX_LINES = 100000;
+    static constexpr int MAX_SECONDS = 60 * 5;
+    static constexpr size_t FALLBACK_MAX_SIZE = 4096;
 };
