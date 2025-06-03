@@ -11,16 +11,17 @@
 #include <condition_variable>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <boost/lockfree/queue.hpp>
+#include <liburing.h>
 
 class TimedLineWriter {
 public:
     TimedLineWriter(const std::string& filenamePrefix,
                     size_t maxBatchBytes,
                     size_t poolSize,
-                    int maxBatchDelayMs)
+                    int maxBatchDelayMs,
+                    unsigned int uringDepth = 32)
         : filenamePrefix(filenamePrefix),
           maxBatchBytes(maxBatchBytes),
           maxBatchDelayMs(maxBatchDelayMs),
@@ -28,13 +29,13 @@ public:
           stringPool(poolSize),
           stopFlag(false),
           lineCount(0),
-          mappedSize(0),
           writeOffset(0),
           fd(-1),
-          mappedData(nullptr) {
+          uringDepth(uringDepth) {
         for (size_t i = 0; i < poolSize; ++i) {
             stringPool.push(new std::string);
         }
+        io_uring_queue_init(uringDepth, &ring, 0);
         openNewFile();
         workerThread = std::thread(&TimedLineWriter::processQueue, this);
     }
@@ -43,6 +44,7 @@ public:
         stopFlag = true;
         if (workerThread.joinable()) workerThread.join();
         closeFile();
+        io_uring_queue_exit(&ring);
         std::string* ptr;
         while (stringPool.pop(ptr)) delete ptr;
     }
@@ -95,26 +97,9 @@ private:
         strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", &localTime);
 
         filename = filenamePrefix + "_" + buffer + ".log";
-        fd = ::open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        fd = ::open(filename.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd == -1) {
             std::cerr << "Failed to open file." << std::endl;
-            return;
-        }
-
-        mappedSize = 10 * 1024 * 1024;  // 10MB
-        if (ftruncate(fd, mappedSize) == -1) {
-            std::cerr << "Failed to set file size." << std::endl;
-            ::close(fd);
-            fd = -1;
-            return;
-        }
-
-        mappedData = static_cast<char*>(mmap(nullptr, mappedSize, PROT_WRITE, MAP_SHARED, fd, 0));
-        if (mappedData == MAP_FAILED) {
-            std::cerr << "Failed to mmap file." << std::endl;
-            ::close(fd);
-            fd = -1;
-            mappedData = nullptr;
             return;
         }
 
@@ -125,11 +110,6 @@ private:
     }
 
     void closeFile() {
-        if (mappedData && mappedData != MAP_FAILED) {
-            msync(mappedData, writeOffset, MS_SYNC);
-            munmap(mappedData, mappedSize);
-            mappedData = nullptr;
-        }
         if (fd != -1) {
             ::close(fd);
             fd = -1;
@@ -153,6 +133,28 @@ private:
             duration >= MAX_SECONDS ||
             localTime.tm_mday != openDay) {
             openNewFile();
+        }
+    }
+
+    void submitWriteAsync(const std::string& data) {
+        struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
+        if (!sqe) return;
+
+        char* buffer = new char[data.size()];
+        memcpy(buffer, data.data(), data.size());
+
+        io_uring_prep_write(sqe, fd, buffer, data.size(), writeOffset);
+        io_uring_sqe_set_data(sqe, buffer);
+        io_uring_submit(&ring);
+
+        writeOffset += data.size();
+    }
+
+    void completeWrites() {
+        struct io_uring_cqe* cqe;
+        while (io_uring_peek_cqe(&ring, &cqe) == 0) {
+            delete[] static_cast<char*>(io_uring_cqe_get_data(cqe));
+            io_uring_cqe_seen(&ring, cqe);
         }
     }
 
@@ -207,11 +209,8 @@ private:
             if (shouldFlush && batchSizeBytes > 0) {
                 manageFileRotation();
                 std::string batchStr = batchBuffer.str();
-                if (writeOffset + batchStr.size() < mappedSize) {
-                    memcpy(mappedData + writeOffset, batchStr.data(), batchStr.size());
-                    writeOffset += batchStr.size();
-                    msync(mappedData, writeOffset, MS_SYNC);
-                }
+                submitWriteAsync(batchStr);
+                completeWrites();
                 batchBuffer.str("");
                 batchBuffer.clear();
                 batchSizeBytes = 0;
@@ -221,12 +220,15 @@ private:
             if (stopFlag && queue.empty() && batchSizeBytes == 0 && fallbackBuffer.empty())
                 break;
         }
+
+        completeWrites();
     }
 
 private:
     const std::string filenamePrefix;
     const size_t maxBatchBytes;
     const int maxBatchDelayMs;
+    const unsigned int uringDepth;
     std::string filename;
     std::atomic<bool> stopFlag;
     std::thread workerThread;
@@ -242,9 +244,8 @@ private:
     std::deque<std::string> fallbackBuffer;
 
     int fd;
-    char* mappedData;
-    size_t mappedSize;
     size_t writeOffset;
+    struct io_uring ring;
 
     static constexpr int MAX_LINES = 100000;
     static constexpr int MAX_SECONDS = 60 * 5;
